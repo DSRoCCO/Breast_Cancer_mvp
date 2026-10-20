@@ -1,0 +1,914 @@
+---
+title: "Análisis integral: diagnóstico de cáncer de mama"
+subtitle: "Calidad, exploración, hallazgos y evaluación predictiva académica"
+lang: es
+format:
+  html:
+    toc: true
+    toc-location: left
+    embed-resources: true
+    code-fold: true
+  pdf:
+    toc: true
+    number-sections: true
+    pdf-engine: pdflatex
+execute:
+  echo: false
+  warning: false
+  message: false
+  freeze: false
+---
+
+```{r}
+#| label: configuracion
+set.seed(20261017)
+
+# Activa la biblioteca aislada del proyecto cuando el documento se ejecuta desde
+# notebook/. No instala dependencias durante el renderizado.
+if (file.exists(file.path("..", "renv", "activate.R"))) suppressWarnings(source(file.path("..", "renv", "activate.R")))
+
+required_packages <- c(
+  "dplyr", "tidyr", "ggplot2", "scales", "knitr", "purrr",
+  "rsample", "recipes", "parsnip", "workflows", "tune", "dials",
+  "yardstick", "glmnet", "ranger", "kernlab", "naivebayes",
+  "discrim", "kknn", "bonsai", "nnet", "patchwork"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+  logical(1), quietly = TRUE
+)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Faltan paquetes requeridos: ", paste(missing_packages, collapse = ", "),
+    ". Instálelos antes de renderizar; el documento no instala dependencias automáticamente."
+  )
+}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(tidymodels)
+library(discrim)
+library(patchwork)
+
+theme_set(theme_minimal(base_size = 11) + theme(
+  plot.title = element_text(face = "bold"),
+  plot.subtitle = element_text(colour = "#4D4D4D"),
+  panel.grid.minor = element_blank()
+))
+
+# Semántica visual constante del diagnóstico en todo el informe.
+# Paleta Okabe-Ito: contraste alto y legible para distintos tipos de visión del color.
+paleta_diagnostico <- c("B" = "#0072B2", "M" = "#D55E00")
+paleta_diagnostico_suave <- c("B" = "#B9D8EE", "M" = "#F6C0B9")
+
+data_path <- file.path("..", "data", "data.csv")
+stopifnot(file.exists(data_path))
+
+# Métricas y utilidades explícitas para que la evaluación no dependa de
+# instalaciones adicionales. La clase positiva es maligno (M).
+classification_metrics <- function(truth, estimate, positive = "M") {
+  truth <- factor(truth, levels = c("B", "M"))
+  estimate <- factor(estimate, levels = c("B", "M"))
+  cm <- table(Real = truth, Prediccion = estimate)
+  tn <- cm["B", "B"]; fp <- cm["B", "M"]
+  fn <- cm["M", "B"]; tp <- cm["M", "M"]
+  tibble(
+    sensibilidad = tp / (tp + fn),
+    especificidad = tn / (tn + fp),
+    precision = ifelse(tp + fp == 0, NA_real_, tp / (tp + fp)),
+    balanced_accuracy = (tp / (tp + fn) + tn / (tn + fp)) / 2,
+    accuracy = (tp + tn) / sum(cm)
+  )
+}
+
+roc_curve_data <- function(truth, probability) {
+  thresholds <- sort(unique(c(Inf, probability, -Inf)), decreasing = TRUE)
+  tibble(umbral = thresholds) |>
+    rowwise() |>
+    mutate(
+      sensibilidad = sum(truth == "M" & probability >= umbral) / sum(truth == "M"),
+      fpr = sum(truth == "B" & probability >= umbral) / sum(truth == "B")
+    ) |>
+    ungroup()
+}
+
+auc_rank <- function(truth, probability) {
+  n_pos <- sum(truth == "M"); n_neg <- sum(truth == "B")
+  (sum(rank(probability)[truth == "M"]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+```
+
+# 1. Objetivo y alcance
+
+Este documento estudia las mediciones de núcleos celulares extraídas de imágenes digitalizadas de aspirados con aguja fina (FNA) de masas mamarias. La unidad de análisis es una masa mamaria; el resultado observado es `diagnosis`: **M** (maligno) o **B** (benigno).
+
+El propósito es producir evidencia reproducible sobre calidad, estructura y patrones de los datos, seguida de una evaluación predictiva académica. No es un instrumento clínico, no identifica causas y no debe utilizarse para diagnosticar pacientes.
+
+| Aspecto | Definición |
+|---|---|
+| Fuente | `data/data.csv` suministrado con el proyecto; dataset Breast Cancer Wisconsin (Diagnostic) |
+| Cobertura observada | 569 masas mamarias y 30 medidas numéricas |
+| Target | Diagnóstico B/M |
+| Momento de disponibilidad supuesto | Las 30 mediciones FNA están disponibles al evaluar la masa |
+| Limitaciones | No hay fecha, demografía, tratamiento, procedencia clínica ni validación externa |
+
+## Cómo avanza el análisis
+
+El informe separa deliberadamente dos tipos de trabajo. La **exploración** describe patrones y formula hipótesis; no elige el modelo ni consulta la prueba. El **proceso principal** toma decisiones reproducibles únicamente con el conjunto de entrenamiento y validación cruzada. Esta distinción evita convertir un hallazgo visual en una conclusión predictiva.
+
+| Etapa | Tipo | Pregunta que responde | Qué habilita después |
+|---|---|---|---|
+| Calidad y partición | Proceso principal | ¿La fuente es utilizable y qué datos quedan realmente reservados? | Trabajar sin imputación ni deduplicación y bloquear la prueba. |
+| Distribuciones, tamaños de efecto y AUROC aislado | Exploración | ¿Qué diferencias y solapamientos se observan en entrenamiento? | Formular hipótesis sobre señal individual. |
+| Correlación, PCA e importancias exploratorias | Exploración | ¿Hay redundancia o estructura multivariable que convenga poner a prueba? | Comparar representaciones con y sin reducción, no decidir por una gráfica. |
+| Ablación de representación | Proceso principal | ¿`mean`, `mean + worst`, todas las variables o PCA generalizan mejor en CV? | Fijar la representación para la comparación de algoritmos. |
+| Comparación, ajuste y prueba final | Proceso principal | ¿Qué enfoque mantiene sensibilidad sin un coste desproporcionado? | Elegir un campeón por CV y medirlo una sola vez en prueba. |
+
+# 2. Carga y contrato de calidad
+
+```{r}
+#| label: carga-y-auditoria
+raw_data <- read.csv(data_path, check.names = FALSE, stringsAsFactors = FALSE)
+empty_columns <- names(raw_data)[vapply(raw_data, function(x) all(is.na(x) | x == ""), logical(1))]
+
+# Vista diagnóstica: no se sobrescribe la fuente. La última columna vacía proviene
+# del delimitador final del CSV; se elimina sólo de la vista analítica.
+diagnostic_data <- raw_data
+analysis_data <- raw_data |>
+  # El nombre del campo puede ser una cadena vacía, que tidyselect no acepta.
+  # El filtrado lógico conserva el resto del esquema sin modificar la fuente.
+  (
+    function(x) x[, !(names(x) %in% empty_columns), drop = FALSE]
+  )() |>
+  mutate(diagnosis = factor(diagnosis, levels = c("B", "M")))
+
+quality_summary <- tibble(
+  control = c("Filas de la fuente", "Columnas de la fuente", "Columnas vacías", "Filas tras vista analítica",
+              "Columnas tras vista analítica", "Valores faltantes (vista analítica)",
+              "Filas duplicadas exactas", "IDs duplicados"),
+  valor = c(nrow(raw_data), ncol(raw_data), paste(empty_columns, collapse = ", "), nrow(analysis_data),
+            ncol(analysis_data), sum(is.na(analysis_data)), sum(duplicated(analysis_data)),
+            sum(duplicated(analysis_data$id)))
+)
+
+missing_by_column <- analysis_data |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "faltantes") |>
+  arrange(desc(faltantes))
+
+# La prueba se reserva una única vez. Los rankings con modelos posteriores usan
+# sólo entrenamiento; la prueba no participa en ellos.
+set.seed(20261017)
+model_data <- analysis_data |> mutate(diagnosis = factor(diagnosis, levels = c("M", "B")))
+split_data <- initial_split(model_data, prop = .80, strata = diagnosis)
+train_data <- training(split_data)
+test_data <- testing(split_data)
+estado_aleatorio_post_split <- .Random.seed
+
+full_numeric_features <- analysis_data |> select(-id, -diagnosis)
+train_numeric_features <- train_data |> select(-id, -diagnosis)
+
+# Las observaciones extremas se revisan antes de la exploración con el target.
+# Se conservan: una rareza estadística no es evidencia de error de captura.
+z_scores_train <- scale(train_numeric_features)
+unusual_cases <- train_data |>
+  transmute(id, diagnosis, max_z = apply(abs(z_scores_train), 1, max)) |>
+  arrange(desc(max_z)) |>
+  slice_head(n = 5)
+
+split_summary <- bind_rows(
+  train_data |> count(diagnosis, name = "n") |> mutate(conjunto = "Entrenamiento"),
+  test_data |> count(diagnosis, name = "n") |> mutate(conjunto = "Prueba reservada")
+) |> group_by(conjunto) |> mutate(porcentaje = n / sum(n)) |> ungroup()
+```
+
+La fuente se conserva intacta. Se detectó una columna completamente vacía (`r paste(empty_columns, collapse = ", ")`) derivada del delimitador final del archivo; no contiene información y se excluye sólo de la vista analítica.
+
+```{r}
+#| label: tabla-calidad
+kable(quality_summary, col.names = c("Control", "Resultado"))
+```
+
+```{r}
+#| label: faltantes
+kable(head(missing_by_column, 7), col.names = c("Variable", "Faltantes"))
+```
+
+**Conclusión descriptiva.** La vista analítica tiene `r nrow(analysis_data)` registros, `r ncol(analysis_data)` columnas y `r sum(is.na(analysis_data))` valores faltantes. Hay `r sum(duplicated(analysis_data))` filas duplicadas exactas y `r sum(duplicated(analysis_data$id))` IDs repetidos. Por tanto, no se aplican imputación, deduplicación ni exclusión de registros.
+
+```{r}
+#| label: particion-y-atipicos
+kable(split_summary, digits = 3,
+      col.names = c("Conjunto", "Diagnóstico", "Casos", "Proporción"),
+      caption = "Partición estratificada bloqueada antes de la exploración guiada por diagnóstico")
+kable(unusual_cases, digits = 2,
+      col.names = c("ID", "Diagnóstico", "Máximo |z| entre medidas"),
+      caption = "Cinco casos estadísticamente inusuales en entrenamiento")
+```
+
+**Decisión del proceso principal.** La prueba contiene `r nrow(test_data)` casos y queda bloqueada desde este punto. Los casos inusuales se mantienen porque no hay evidencia de un error de calidad; eliminarlos por ser extremos cambiaría la población sin justificación. No se usarán para seleccionar modelos.
+
+# 3. Descripción del diagnóstico y las mediciones
+
+```{r}
+#| label: distribucion-clases
+class_counts <- analysis_data |>
+  count(diagnosis, name = "n") |>
+  mutate(porcentaje = n / sum(n))
+
+ggplot(class_counts, aes(x = diagnosis, y = n, fill = diagnosis)) +
+  geom_col(width = .62, show.legend = FALSE) +
+  geom_text(aes(label = paste0(n, " (", percent(porcentaje, accuracy = .1), ")")), vjust = -0.35) +
+  scale_fill_manual(values = paleta_diagnostico) +
+  labs(title = "Distribución del diagnóstico", x = "Diagnóstico", y = "Número de masas") +
+  expand_limits(y = max(class_counts$n) * 1.12)
+```
+
+**Lectura del gráfico.** Predominan los casos benignos (`r percent(class_counts$porcentaje[class_counts$diagnosis == "B"], accuracy = .1)`) frente a los malignos (`r percent(class_counts$porcentaje[class_counts$diagnosis == "M"], accuracy = .1)`). El desbalance es moderado, no extremo, pero una métrica de accuracy por sí sola podría ocultar errores en malignos; por ello la evaluación posterior prioriza sensibilidad y balanced accuracy.
+
+```{r}
+#| label: resumen-numerico
+numeric_features <- full_numeric_features
+
+summary_numeric <- numeric_features |>
+  summarise(across(everything(), list(
+    media = ~ mean(.x), mediana = ~ median(.x), sd = ~ sd(.x),
+    minimo = ~ min(.x), maximo = ~ max(.x)
+  ))) |>
+  pivot_longer(everything(), names_to = c("variable", ".value"), names_pattern = "(.*)_(media|mediana|sd|minimo|maximo)$") |>
+  arrange(desc(sd))
+
+kable(head(summary_numeric, 7), digits = 3, caption = "Siete variables con mayor dispersión absoluta")
+```
+
+El conjunto contiene `r class_counts$n[class_counts$diagnosis == "B"]` masas benignas (`r percent(class_counts$porcentaje[class_counts$diagnosis == "B"], accuracy = .1)`) y `r class_counts$n[class_counts$diagnosis == "M"]` malignas (`r percent(class_counts$porcentaje[class_counts$diagnosis == "M"], accuracy = .1)`). Esta distribución hace necesario reportar sensibilidad y especificidad, no sólo exactitud global.
+
+# 4. Exploración supervisada en entrenamiento
+
+Esta sección es **exploratoria**: utiliza sólo el 80% de entrenamiento para evitar que la prueba influya en las hipótesis. Sus resultados describen asociaciones y solapamientos; todavía no seleccionan variables ni algoritmos.
+
+```{r}
+#| label: tamano-efecto
+effect_sizes <- train_numeric_features |>
+  names() |>
+  lapply(function(feature) {
+    b <- train_data |> filter(diagnosis == "B") |> pull(all_of(feature))
+    m <- train_data |> filter(diagnosis == "M") |> pull(all_of(feature))
+    pooled_sd <- sqrt(((length(b) - 1) * var(b) + (length(m) - 1) * var(m)) / (length(b) + length(m) - 2))
+    tibble(variable = feature, diferencia_estandarizada_M_vs_B = (mean(m) - mean(b)) / pooled_sd,
+           media_benigno = mean(b), media_maligno = mean(m))
+  }) |>
+  bind_rows() |>
+  mutate(abs_efecto = abs(diferencia_estandarizada_M_vs_B)) |>
+  arrange(desc(abs_efecto))
+
+mean_effects <- effect_sizes |>
+  filter(grepl("_mean$", variable)) |>
+  mutate(
+    etiqueta = gsub("_", " ", sub("_mean$", "", variable)),
+    etiqueta = tools::toTitleCase(etiqueta),
+    n_b = sum(train_data$diagnosis == "B"), n_m = sum(train_data$diagnosis == "M"),
+    # Error estándar aproximado para Cohen's d; sólo expresa incertidumbre
+    # descriptiva de esta muestra, no causalidad.
+    se_d = sqrt((n_b + n_m) / (n_b * n_m) + diferencia_estandarizada_M_vs_B^2 / (2 * (n_b + n_m - 2))),
+    inferior = diferencia_estandarizada_M_vs_B - 1.96 * se_d,
+    superior = diferencia_estandarizada_M_vs_B + 1.96 * se_d
+  ) |>
+  arrange(diferencia_estandarizada_M_vs_B) |>
+  mutate(etiqueta = factor(etiqueta, levels = etiqueta))
+```
+
+## Distribuciones por familia: promedio frente a peor valor
+
+Para evitar una selección arbitraria, se muestran las diez familias originales del conjunto de datos. Cada fila compara el resumen promedio (`mean`) con el promedio de los tres valores más altos (`worst`); los errores estándar (`se`) se excluyen de esta visualización para conservar una lectura centrada en nivel promedio y severidad. Las escalas son independientes por panel: la comparación válida es B frente a M dentro de cada panel, no la altura entre familias distintas.
+
+```{r}
+#| label: preparar-boxplots-familias
+familias_boxplot <- c(
+  "radius", "texture", "perimeter", "area", "smoothness",
+  "compactness", "concavity", "concave points", "symmetry", "fractal_dimension"
+)
+
+boxplots_familias <- train_data |>
+  select(diagnosis, all_of(c(paste0(familias_boxplot, "_mean"), paste0(familias_boxplot, "_worst")))) |>
+  pivot_longer(-diagnosis, names_to = c("familia", "resumen"), names_pattern = "(.*)_(mean|worst)$", values_to = "valor") |>
+  mutate(
+    familia = factor(familia, levels = familias_boxplot,
+                     labels = tools::toTitleCase(gsub("_", " ", familias_boxplot))),
+    resumen = factor(resumen, levels = c("mean", "worst"), labels = c("Promedio", "Peor valor"))
+  )
+
+grafico_boxplots_familias <- function(familias, titulo) {
+  ggplot(filter(boxplots_familias, familia %in% familias), aes(x = diagnosis, y = valor, fill = diagnosis, colour = diagnosis)) +
+    geom_boxplot(width = .62, linewidth = .7, outlier.colour = "#5A5A5A", outlier.alpha = .35, outlier.size = .8) +
+    facet_grid(familia ~ resumen, scales = "free_y") +
+    scale_fill_manual(values = paleta_diagnostico_suave, guide = "none") +
+    scale_colour_manual(values = paleta_diagnostico, guide = "none") +
+    labs(title = titulo, subtitle = "Comparar B frente a M dentro de cada panel; escalas independientes", x = "Diagnóstico", y = "Valor") +
+    theme(strip.text.y = element_text(angle = 0))
+}
+```
+
+```{r}
+#| label: boxplots-familias-1
+#| fig-width: 8
+#| fig-height: 7
+grafico_boxplots_familias(levels(boxplots_familias$familia)[1:5],
+                          "Distribuciones por diagnóstico: familias 1 a 5")
+```
+
+```{r}
+#| label: boxplots-familias-2
+#| fig-width: 8
+#| fig-height: 7
+grafico_boxplots_familias(levels(boxplots_familias$familia)[6:10],
+                          "Distribuciones por diagnóstico: familias 6 a 10")
+```
+
+**Lectura de los boxplots.** Las familias de tamaño e irregularidad muestran, en varios paneles, medianas más altas para M que para B, tanto en `mean` como en `worst`. Aun así hay solapamiento y observaciones extremas en ambos diagnósticos: las gráficas explican una señal grupal, no una regla determinista para cada masa ni una importancia predictiva independiente.
+
+## Separación estandarizada de las mediciones promedio
+
+```{r}
+#| label: forest-efectos-media
+ggplot(mean_effects, aes(x = diferencia_estandarizada_M_vs_B, y = etiqueta)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "#666666") +
+  geom_errorbarh(aes(xmin = inferior, xmax = superior), height = .18, colour = "#8FB6D8", linewidth = .8) +
+  geom_point(colour = "#1F5A8A", size = 3) +
+  labs(title = "Forest plot: mediciones promedio",
+       subtitle = "Cohen's d e IC aproximado al 95%", x = "Diferencia estandarizada (M - B)", y = NULL)
+```
+
+```{r}
+#| label: tabla-efectos-media
+kable(mean_effects |> select(etiqueta, diferencia_estandarizada_M_vs_B, inferior, superior), digits = 3,
+      col.names = c("Medición promedio", "Cohen's d", "IC 95% inferior", "IC 95% superior"))
+```
+
+**Insight asociativo.** Entre las mediciones promedio, `r as.character(mean_effects$etiqueta[nrow(mean_effects)])` presenta la mayor diferencia estandarizada observada entre diagnósticos (M frente a B: `r round(mean_effects$diferencia_estandarizada_M_vs_B[nrow(mean_effects)], 2)` desviaciones estándar). El forest plot ordena las diez variables y añade intervalos de confianza aproximados. Esto justifica examinar señal individual, pero no demuestra causalidad ni permite descartar las otras variables.
+
+## AUROC univariado: discriminación de una medición aislada
+
+El AUROC univariado pregunta qué tan bien puede una sola medición ordenar casos malignos por encima de benignos, sin usar las demás variables. Un valor de 0.50 equivale a discriminación aleatoria; cuanto más se acerca a 1, mejor es su capacidad individual de ordenar los diagnósticos. Este cálculo y los siguientes modelos de importancia usan exclusivamente entrenamiento.
+
+```{r}
+#| label: preparar-auroc
+auroc_univariado <- names(train_data |> select(-id, -diagnosis)) |>
+  lapply(function(variable) {
+    auroc_bruto <- auc_rank(train_data$diagnosis, train_data[[variable]])
+    tibble(variable = variable, auroc = max(auroc_bruto, 1 - auroc_bruto))
+  }) |>
+  bind_rows() |>
+  arrange(desc(auroc))
+```
+
+```{r}
+#| label: auroc-univariado
+auroc_univariado |>
+  slice_head(n = 15) |>
+  arrange(auroc) |>
+  mutate(variable = factor(variable, levels = variable)) |>
+  ggplot(aes(x = auroc, y = variable)) +
+  geom_vline(xintercept = .50, linetype = "dashed", colour = "#666666") +
+  geom_segment(aes(x = .50, xend = auroc, yend = variable), colour = "#8FB6D8", linewidth = .9) +
+  geom_point(colour = "#1F5A8A", size = 3) +
+  scale_x_continuous(limits = c(.50, 1), labels = number_format(accuracy = .01)) +
+  labs(title = "AUROC univariado: 15 mejores mediciones",
+       subtitle = "Capacidad individual de ordenar B y M; 0.50 = azar", x = "AUROC", y = NULL)
+```
+
+**Resultado univariado.** `r auroc_univariado$variable[1]` logra el AUROC individual más alto (`r round(auroc_univariado$auroc[1], 3)`) en entrenamiento. Esto identifica una medición prometedora aislada, pero no demuestra que conserve aporte independiente al combinarse con las demás.
+
+# 5. Exploración de redundancia y estructura multivariable
+
+La señal aislada no basta para decidir qué variables conservar: dos mediciones pueden separar B/M y, aun así, transportar casi la misma información. Por eso se revisa la estructura conjunta de entrenamiento. Esta evidencia formula la hipótesis de que una representación compacta podría funcionar bien; no elimina columnas por una regla visual.
+
+```{r}
+#| label: familias-medicion
+family_effects <- effect_sizes |>
+  mutate(familia = case_when(
+    grepl("_mean$", variable) ~ "Media",
+    grepl("_se$", variable) ~ "Error estándar",
+    grepl("_worst$", variable) ~ "Peor valor"
+  )) |>
+  group_by(familia) |>
+  summarise(efecto_absoluto_medio = mean(abs_efecto), .groups = "drop") |>
+  arrange(desc(efecto_absoluto_medio))
+
+ggplot(family_effects, aes(x = reorder(familia, efecto_absoluto_medio), y = efecto_absoluto_medio, fill = familia)) +
+  geom_col(show.legend = FALSE, width = .65) +
+  geom_text(aes(label = round(efecto_absoluto_medio, 2)), vjust = -0.35) +
+  labs(title = "Señal descriptiva media por familia de mediciones",
+       subtitle = "Promedio de diferencias estandarizadas absolutas entre M y B", x = NULL, y = "Magnitud media") +
+  expand_limits(y = max(family_effects$efecto_absoluto_medio) * 1.15)
+
+correlations <- cor(train_numeric_features)
+diag(correlations) <- NA
+correlation_pairs <- as.data.frame(as.table(correlations), stringsAsFactors = FALSE) |>
+  transmute(variable_1 = Var1, variable_2 = Var2, correlacion = Freq) |>
+  filter(!is.na(correlacion), variable_1 < variable_2) |>
+  mutate(abs_correlacion = abs(correlacion)) |>
+  arrange(desc(abs_correlacion))
+
+strongest_pair <- slice_head(correlation_pairs, n = 1)
+high_corr_pairs <- correlation_pairs |> filter(abs_correlacion >= .85)
+
+# Las diez mediciones promedio permiten interpretar las propiedades nucleares
+# sin repetir los resúmenes derivados _se y _worst en una matriz 30 x 30.
+mean_variables <- grep("_mean$", names(train_numeric_features), value = TRUE)
+mean_correlations <- cor(train_numeric_features |> select(all_of(mean_variables)))
+mean_order <- colnames(mean_correlations)[hclust(as.dist(1 - abs(mean_correlations)))$order]
+mean_correlation_long <- as.data.frame(as.table(mean_correlations[mean_order, mean_order]), stringsAsFactors = FALSE) |>
+  transmute(variable_1 = Var1, variable_2 = Var2, correlacion = Freq,
+            i = match(Var1, mean_order), j = match(Var2, mean_order)) |>
+  filter(i < j) |>
+  mutate(etiqueta_r = sprintf("%.2f", correlacion),
+         color_texto = if_else(abs(correlacion) >= .55, "claro", "oscuro"))
+top_correlation_pairs <- correlation_pairs |> slice_head(n = 12) |>
+  mutate(par = paste(variable_1, "—", variable_2), par = factor(par, levels = rev(par)))
+```
+
+```{r}
+#| label: mapa-correlacion
+#| fig-width: 8
+#| fig-height: 6
+ggplot(mean_correlation_long, aes(variable_1, variable_2, fill = correlacion)) +
+  geom_tile(colour = "white", linewidth = .35) + coord_fixed() +
+  geom_text(aes(label = etiqueta_r, colour = color_texto), size = 3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0, limits = c(-1, 1), name = "r") +
+  scale_colour_manual(values = c("claro" = "white", "oscuro" = "#333333"), guide = "none") +
+  labs(title = "Correlación entre las 10 mediciones promedio",
+       subtitle = "Triángulo superior; r mostrado con dos decimales y ordenado por similitud absoluta", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+```
+
+```{r}
+#| label: ranking-pares-correlacion
+#| fig-width: 8
+#| fig-height: 5.5
+ggplot(top_correlation_pairs, aes(x = abs_correlacion, y = par, colour = correlacion > 0)) +
+  geom_vline(xintercept = .85, linetype = "dashed", colour = "#666666") +
+  geom_segment(aes(x = 0, xend = abs_correlacion, yend = par), colour = "#B9D8EE", linewidth = .9) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"), labels = c("TRUE" = "Positiva", "FALSE" = "Negativa"), name = "Signo") +
+  scale_x_continuous(limits = c(0, 1), labels = number_format(accuracy = .01)) +
+  labs(title = "Pares más redundantes entre las 30 mediciones",
+       subtitle = "La línea marca |r| = 0.85; cada par se muestra una sola vez", x = "Correlación absoluta", y = NULL)
+```
+
+```{r}
+#| label: correlacion-principal
+pair_data <- train_data |>
+  select(diagnosis, all_of(c(strongest_pair$variable_1, strongest_pair$variable_2)))
+
+ggplot(pair_data, aes(x = .data[[strongest_pair$variable_1]], y = .data[[strongest_pair$variable_2]], colour = diagnosis)) +
+  geom_point(alpha = .65, size = 1.7) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = .7) +
+  scale_colour_manual(values = paleta_diagnostico) +
+  labs(title = "Relación más correlacionada entre mediciones", x = strongest_pair$variable_1,
+       y = strongest_pair$variable_2, colour = "Diagnóstico")
+```
+
+**Lectura por familia.** La barra de **`r family_effects$familia[1]`** es la más alta (`r round(family_effects$efecto_absoluto_medio[1], 2)`): sus resúmenes muestran, en promedio, la mayor separación descriptiva B/M. Esto motiva contrastar la familia completa, pero no convierte a toda medición `_worst` en necesaria para todos los modelos.
+
+**Lectura de redundancia.** La matriz triangular se limita a las diez mediciones `_mean` para interpretar las relaciones entre propiedades nucleares sin duplicar resúmenes derivados. El ranking conserva la evidencia completa: hay `r nrow(high_corr_pairs)` de `r nrow(correlation_pairs)` pares entre las 30 mediciones con correlación absoluta de al menos 0.85. El par más intenso, `r strongest_pair$variable_1` y `r strongest_pair$variable_2`, alcanza `r round(strongest_pair$correlacion, 3)`. La redundancia no es un error: se probará formalmente si una reducción mantiene desempeño CV.
+
+# 6. Exploración multivariable: PCA e importancias condicionadas
+
+```{r}
+#| label: preparar-pca
+pca_fit <- prcomp(train_numeric_features, center = TRUE, scale. = TRUE)
+pca_scores <- as.data.frame(pca_fit$x[, 1:2]) |>
+  mutate(diagnosis = train_data$diagnosis, id = train_data$id)
+explained_variance <- summary(pca_fit)$importance[2, 1:2]
+pca_variance <- tibble(componente = seq_along(pca_fit$sdev), proporcion = pca_fit$sdev^2 / sum(pca_fit$sdev^2)) |>
+  mutate(acumulada = cumsum(proporcion))
+pca_display <- pca_variance |> filter(componente <= 15)
+pca_thresholds <- tibble(umbral = c(.80, .90)) |>
+  rowwise() |>
+  mutate(componente = min(pca_variance$componente[pca_variance$acumulada >= umbral]),
+         valor = pca_variance$acumulada[componente],
+         etiqueta = paste0(percent(umbral), " en PC", componente),
+         panel = "Varianza acumulada") |>
+  ungroup()
+pca_loadings <- as.data.frame(pca_fit$rotation[, 1:2]) |> tibble::rownames_to_column("variable") |>
+  pivot_longer(-variable, names_to = "componente", values_to = "carga") |>
+  group_by(componente) |> slice_max(abs(carga), n = 8, with_ties = FALSE) |> ungroup() |>
+  mutate(variable = reorder(variable, carga))
+```
+
+```{r}
+#| label: varianza-pca
+ggplot() +
+  geom_col(data = pca_display |> mutate(panel = "Aporte individual"),
+           aes(componente, proporcion), fill = "#0072B2", width = .75) +
+  geom_line(data = pca_display |> mutate(panel = "Varianza acumulada"),
+            aes(componente, acumulada), colour = "#D55E00", linewidth = .9) +
+  geom_point(data = pca_display |> mutate(panel = "Varianza acumulada"),
+             aes(componente, acumulada), colour = "#D55E00", size = 1.8) +
+  geom_hline(data = pca_thresholds, aes(yintercept = umbral), linetype = "dashed", colour = "#777777") +
+  geom_point(data = pca_thresholds, aes(componente, valor), colour = "#D55E00", size = 2.4) +
+  geom_text(data = pca_thresholds, aes(componente, valor, label = etiqueta),
+            vjust = -0.7, size = 3.1, colour = "#444444") +
+  facet_wrap(~ panel, ncol = 2) +
+  scale_x_continuous(breaks = seq(1, 15, by = 2)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.03)) +
+  labs(title = "Cómo PCA concentra la variabilidad de entrenamiento",
+       subtitle = "Izquierda: aporte de cada componente. Derecha: información acumulada al sumar componentes.",
+       x = "Componente principal", y = "Proporción de varianza")
+```
+
+## Componente principal
+
+Un componente principal (`PC`) es una variable nueva construida como combinación lineal de las 30 mediciones originales estandarizadas; no corresponde a una medición clínica tomada directamente. `PC1` se construye para capturar la mayor cantidad posible de variabilidad total. `PC2` captura la mayor variabilidad que queda y es ortogonal a `PC1`, por lo que no repite su información lineal. El mismo criterio se aplica sucesivamente a `PC3`, `PC4` y los demás componentes.
+
+Cada barra azul representa un componente individual y la proporción de variabilidad que aporta por sí solo. En la curva acumulada, que “90% se alcanza en PC7” significa que el conjunto formado por **PC1 hasta PC7** conserva aproximadamente 90% de la variabilidad de las 30 mediciones; no significa que `PC7` aislado explique 90%.
+
+```{r}
+#| label: cargas-pca
+ggplot(pca_loadings, aes(carga, variable, fill = componente)) +
+  geom_col(show.legend = FALSE) + facet_wrap(~ componente, scales = "free_y") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Variables con mayor carga en los primeros componentes", subtitle = "Las cargas describen los ejes; no son importancia clínica", x = "Carga PCA", y = NULL)
+```
+
+```{r}
+#| label: pca
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, colour = diagnosis)) +
+  geom_point(alpha = .72, size = 2) +
+  stat_ellipse(level = .80, linewidth = .6) +
+  scale_colour_manual(values = paleta_diagnostico) +
+  labs(title = "Proyección PCA de las 30 mediciones estandarizadas",
+       subtitle = paste0("PC1 explica ", percent(explained_variance[1], accuracy = .1),
+                         "; PC2 explica ", percent(explained_variance[2], accuracy = .1)),
+       x = "Componente principal 1", y = "Componente principal 2", colour = "Diagnóstico")
+
+```
+
+**Lectura PCA.** El panel izquierdo permite localizar el descenso del aporte individual; el derecho responde cuántos componentes se necesitan para conservar información: 80% se alcanza en PC`r pca_thresholds$componente[pca_thresholds$umbral == .80]` y 90% en PC`r pca_thresholds$componente[pca_thresholds$umbral == .90]`. Los dos primeros componentes resumen `r percent(sum(explained_variance), accuracy = .1)` de la variabilidad estandarizada. Las cargas muestran qué medidas los construyen y la proyección revela separación parcial con solapamiento. Esto no demuestra clusters clínicos; PCA se evaluará después frente a las variables originales con las mismas particiones CV.
+
+## PCA frente a Elastic Net ante redundancia
+
+PCA transforma las 30 mediciones en componentes nuevos y no elimina columnas originales. Elastic Net conserva las mediciones, pero encoge sus coeficientes y puede llevar algunos a cero. Ambos gráficos siguientes son exploratorios y usan únicamente entrenamiento; no intervienen en la selección final ni consultan la prueba reservada.
+
+```{r}
+#| label: preparar-importancias-modelo
+x_entrenamiento <- scale(as.matrix(train_numeric_features))
+y_entrenamiento <- ifelse(train_data$diagnosis == "M", 1, 0)
+set.seed(20261018)
+elastic_exploratorio <- glmnet::cv.glmnet(x_entrenamiento, y_entrenamiento, family = "binomial", alpha = .5, nfolds = 5, type.measure = "deviance", standardize = FALSE)
+coeficientes_elastic_completo <- tibble(variable = rownames(as.matrix(coef(elastic_exploratorio, s = "lambda.1se"))), coeficiente_elastic = as.numeric(as.matrix(coef(elastic_exploratorio, s = "lambda.1se"))[, 1])) |>
+  filter(variable != "(Intercept)") |> mutate(coeficiente_elastic_abs = abs(coeficiente_elastic))
+coeficientes_elastic <- coeficientes_elastic_completo |> filter(coeficiente_elastic != 0) |>
+  mutate(coeficiente = coeficiente_elastic, magnitud = coeficiente_elastic_abs, direccion = if_else(coeficiente_elastic > 0, "Asociación con M", "Asociación con B")) |>
+  arrange(magnitud) |> slice_tail(n = 15) |> mutate(variable = factor(variable, levels = variable))
+importancia_rf <- ranger::ranger(dependent.variable.name = "diagnosis", data = train_data |> select(-id), probability = TRUE, importance = "permutation", num.trees = 500, seed = 20261019)$variable.importance |>
+  tibble::enframe(name = "variable", value = "importancia_rf_permutacion") |> arrange(desc(importancia_rf_permutacion))
+.Random.seed <- estado_aleatorio_post_split
+```
+
+```{r}
+#| label: elastic-net-exploratorio
+ggplot(coeficientes_elastic, aes(x = coeficiente, y = variable, fill = direccion)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "#666666") +
+  geom_col(width = .7) +
+  scale_fill_manual(values = c("Asociación con M" = "#D55E00", "Asociación con B" = "#0072B2")) +
+  labs(title = "Elastic Net: mediciones originales retenidas",
+       subtitle = "Predictoras estandarizadas; selección con lambda.1se",
+       x = "Coeficiente regularizado", y = NULL, fill = NULL)
+```
+
+**Resultado lineal penalizado.** `r as.character(coeficientes_elastic$variable[nrow(coeficientes_elastic)])` tiene la mayor magnitud de coeficiente entre las mediciones mostradas. Elastic Net busca una representación lineal más compacta, reduciendo coeficientes de señales redundantes; un coeficiente alto indica aporte condicionado al resto de predictores, no causalidad ni importancia clínica automática. PCA resume patrones compartidos —por ejemplo, tamaño— en componentes nuevos; Elastic Net conserva nombres de variables originales. Ninguno sustituye la comparación validada de modelos.
+
+```{r}
+#| label: importancia-random-forest
+importancia_rf |> slice_head(n = 15) |> arrange(importancia_rf_permutacion) |>
+  mutate(variable = factor(variable, levels = variable)) |>
+  ggplot(aes(x = importancia_rf_permutacion, y = variable)) + geom_vline(xintercept = 0, linetype = "dashed", colour = "#666666") +
+  geom_col(fill = "#6F4E9C", width = .7) + labs(title = "Random Forest: importancia por permutación", subtitle = "Exploratoria: caída de desempeño al perturbar una medición", x = "Importancia por permutación", y = NULL)
+```
+
+**Lectura de importancias.** Elastic Net muestra aportes lineales condicionados al resto y Random Forest busca aportes dentro de un ajuste no lineal. En presencia de correlación, ambos pueden repartir importancia entre sustitutos. Por ello sirven para interpretar hipótesis, no para seleccionar columnas de forma definitiva; la siguiente etapa contrasta representaciones completas con validación cruzada.
+
+# 7. Proceso principal: contrastar representaciones
+
+La prueba sigue bloqueada. Primero se responde una pregunta de representación con la misma regresión logística penalizada y las mismas particiones: ¿la información de `worst` o una PCA aporta generalización respecto de `mean`? Sólo entonces se fija la representación y se comparan algoritmos. La clase positiva es M y el umbral es 0.50.
+
+```{r}
+#| label: ablation-representacion
+#| cache: false
+metrics_set <- metric_set(sens, spec, ppv, bal_accuracy, accuracy, roc_auc)
+set.seed(20261020)
+representation_folds <- vfold_cv(train_data, v = 5, repeats = 3, strata = diagnosis)
+all_predictors <- names(train_numeric_features)
+representations <- list(
+  "Sólo mean" = list(vars = grep("_mean$", all_predictors, value = TRUE), pca = FALSE),
+  "Mean + worst" = list(vars = grep("_(mean|worst)$", all_predictors, value = TRUE), pca = FALSE),
+  "Todas sin PCA" = list(vars = all_predictors, pca = FALSE),
+  "Todas + PCA (90% var.)" = list(vars = all_predictors, pca = TRUE)
+)
+
+make_recipe <- function(representation) {
+  excluded <- setdiff(all_predictors, representation$vars)
+  rec <- recipe(diagnosis ~ ., data = train_data) |> update_role(id, new_role = "id")
+  if (length(excluded) > 0) rec <- rec |> step_rm(all_of(excluded))
+  rec <- rec |> step_normalize(all_numeric_predictors())
+  if (representation$pca) rec <- rec |> step_pca(all_numeric_predictors(), threshold = .90)
+  rec
+}
+
+representation_runs <- purrr::imap(representations, function(rep, name) {
+  fit_resamples(workflow() |> add_recipe(make_recipe(rep)) |>
+                  add_model(logistic_reg(penalty = .01, mixture = .5) |> set_engine("glmnet")),
+                resamples = representation_folds, metrics = metrics_set,
+                control = control_resamples(save_pred = TRUE)) |>
+    collect_metrics() |> mutate(representacion = name)
+})
+representation_summary <- bind_rows(representation_runs) |>
+  select(representacion, .metric, mean, std_err) |> pivot_wider(names_from = .metric, values_from = c(mean, std_err)) |>
+  rename(sensibilidad = mean_sens, especificidad = mean_spec, precision = mean_ppv,
+         balanced_accuracy = mean_bal_accuracy, accuracy = mean_accuracy, roc_auc = mean_roc_auc,
+         ee_sensibilidad = std_err_sens, ee_roc_auc = std_err_roc_auc) |>
+  arrange(desc(sensibilidad), desc(roc_auc), desc(balanced_accuracy))
+selected_representation_name <- representation_summary$representacion[1]
+selected_representation <- representations[[selected_representation_name]]
+base_recipe <- make_recipe(selected_representation)
+```
+
+```{r}
+#| label: resultados-representacion
+kable(representation_summary |> select(representacion, sensibilidad, especificidad, balanced_accuracy, roc_auc, ee_sensibilidad, ee_roc_auc),
+      digits = 3, col.names = c("Representación", "Sens.", "Espec.", "Bal. acc.", "AUROC", "EE sens.", "EE AUROC"),
+      caption = "Ablación de representación: media CV repetida 5×3 (EE para sensibilidad y AUROC)")
+representation_plot <- representation_summary |> select(representacion, sensibilidad, roc_auc) |>
+  pivot_longer(-representacion, names_to = "metrica", values_to = "valor")
+ggplot(representation_plot, aes(reorder(representacion, valor), valor, fill = metrica)) +
+  geom_col(position = "dodge") + coord_flip() + scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Contraste validado de representaciones", subtitle = "La representación se elige por sensibilidad, luego AUROC y balanced accuracy", x = NULL, y = "Media CV", fill = "Métrica")
+```
+
+**Decisión del proceso principal.** Se fija **`r selected_representation_name`** porque obtiene la mayor sensibilidad media en CV repetida; AUROC y balanced accuracy resuelven empates. Así, `worst` y PCA no se incorporan por intuición ni se excluyen por correlación: su aporte se contrasta en datos no vistos dentro de cada fold. Esta decisión no usa la prueba final.
+
+# 8. Proceso principal: comparación de algoritmos
+
+```{r}
+#| label: comparacion-validada
+#| cache: false
+set.seed(20261021)
+folds <- vfold_cv(train_data, v = 5, strata = diagnosis)
+
+models <- list(
+  "Regresión logística" = logistic_reg() |> set_engine("glm"),
+  "Elastic net" = logistic_reg(penalty = .01, mixture = .5) |> set_engine("glmnet"),
+  "Discriminante lineal" = discrim_linear() |> set_engine("MASS"),
+  "Discriminante cuadrático" = discrim_quad() |> set_engine("MASS"),
+  "kNN" = nearest_neighbor(mode = "classification", neighbors = 15, weight_func = "rectangular") |> set_engine("kknn"),
+  "Árbol de decisión" = decision_tree(mode = "classification", tree_depth = 5, min_n = 10, cost_complexity = .01) |> set_engine("rpart"),
+  "Random forest" = rand_forest(mode = "classification", mtry = 10, min_n = 5, trees = 300) |> set_engine("ranger", importance = "impurity"),
+  "SVM radial" = svm_rbf(mode = "classification", cost = 1, rbf_sigma = .05) |> set_engine("kernlab"),
+  "Naive Bayes" = naive_Bayes() |> set_engine("naivebayes"),
+  "Red neuronal" = mlp(mode = "classification", hidden_units = 5, penalty = .01, epochs = 100) |> set_engine("nnet", trace = FALSE)
+)
+
+evaluate_model <- function(spec, name) {
+  started <- proc.time()[["elapsed"]]
+  fitted <- tryCatch(
+    workflow() |> add_recipe(base_recipe) |> add_model(spec) |>
+      fit_resamples(resamples = folds, metrics = metrics_set,
+                    control = control_resamples(save_pred = TRUE)),
+    error = function(e) e
+  )
+  elapsed <- proc.time()[["elapsed"]] - started
+  if (inherits(fitted, "error")) return(list(name = name, error = conditionMessage(fitted)))
+  list(name = name, result = fitted, seconds = elapsed,
+       metrics = collect_metrics(fitted), predictions = collect_predictions(fitted))
+}
+
+comparison_runs <- purrr::imap(models, evaluate_model)
+failures <- purrr::keep(comparison_runs, ~ !is.null(.x$error))
+successes <- purrr::keep(comparison_runs, ~ is.null(.x$error))
+stopifnot(length(successes) >= 3)
+
+cv_summary <- purrr::map_dfr(successes, function(x) {
+  x$metrics |> select(.metric, mean, std_err) |>
+    pivot_wider(names_from = .metric, values_from = c(mean, std_err)) |>
+    mutate(modelo = x$name, segundos = x$seconds)
+}) |>
+  rename(sensibilidad = mean_sens, especificidad = mean_spec, precision = mean_ppv,
+         balanced_accuracy = mean_bal_accuracy, accuracy = mean_accuracy, roc_auc = mean_roc_auc) |>
+  arrange(desc(sensibilidad), desc(roc_auc), desc(balanced_accuracy))
+
+baseline_summary <- tibble(modelo = "Regla mayoritaria (B)", sensibilidad = 0, especificidad = 1,
+  precision = NA_real_, balanced_accuracy = .5, accuracy = mean(train_data$diagnosis == "B"), roc_auc = .5,
+  segundos = 0, ee_sensibilidad = 0, ee_roc_auc = 0)
+cv_summary <- cv_summary |> mutate(ee_sensibilidad = std_err_sens, ee_roc_auc = std_err_roc_auc)
+
+top_three <- cv_summary |> slice_head(n = 3) |> pull(modelo)
+lider_cv <- cv_summary |> slice_head(n = 1)
+cv_predictions <- purrr::map_dfr(successes, ~ mutate(.x$predictions, modelo = .x$name)) |>
+  filter(modelo %in% top_three)
+```
+
+```{r}
+#| label: tabla-comparacion-cv
+kable(cv_summary |> select(modelo, sensibilidad, especificidad, balanced_accuracy, roc_auc, segundos),
+      digits = 3, col.names = c("Modelo", "Sens.", "Espec.", "Bal. acc.", "AUROC", "Seg."),
+      caption = "Comparación de 10 modelos: media CV estratificada (5 folds); la regla mayoritaria se muestra abajo como referencia")
+kable(baseline_summary |> select(modelo, sensibilidad, especificidad, balanced_accuracy, accuracy, roc_auc),
+      digits = 3, col.names = c("Referencia", "Sens.", "Espec.", "Bal. acc.", "Accuracy", "AUROC"),
+      caption = "Referencia: predecir siempre benigno (no participa en el ranking)")
+if (length(failures) > 0) {
+  kable(tibble(modelo = purrr::map_chr(failures, "name"), error = purrr::map_chr(failures, "error")),
+        caption = "Modelos que no pudieron ajustarse (reportados sin exclusión silenciosa)")
+}
+```
+
+```{r}
+#| label: graficos-comparacion-cv
+ranking_plot <- cv_summary |> select(modelo, sensibilidad, roc_auc) |>
+  pivot_longer(-modelo, names_to = "metrica", values_to = "valor")
+ggplot(ranking_plot, aes(reorder(modelo, valor), valor, fill = metrica)) +
+  geom_col(position = "dodge") + coord_flip() + scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(title = "Ranking de sensibilidad y ROC-AUC por validación cruzada", x = NULL, y = "Media CV", fill = "Métrica")
+
+ggplot(cv_summary, aes(especificidad, sensibilidad, label = modelo)) +
+  geom_point(colour = "#6F4E9C", size = 3) + geom_text(nudge_y = .012, size = 3, check_overlap = TRUE) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+  labs(title = "Sensibilidad frente a especificidad CV", x = "Especificidad CV", y = "Sensibilidad CV")
+```
+
+## Zoom para inspeccionar el área concentrada
+
+Los dos paneles usan exactamente los mismos resultados CV. El panel ampliado declara límites recortados: sirve para comparar diferencias pequeñas, no para sustituir la escala completa.
+
+```{r}
+#| label: sensibilidad-especificidad-paneles
+#| fig-width: 9
+#| fig-height: 5.2
+scatter_cv <- function(x_limits, y_limits, title, subtitle = NULL, show_labels = TRUE) {
+  p <- ggplot(cv_summary, aes(especificidad, sensibilidad, label = modelo)) +
+    geom_point(colour = "#6F4E9C", size = 3) +
+    coord_cartesian(xlim = x_limits, ylim = y_limits) +
+    scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+    labs(title = title, subtitle = subtitle, x = "Especificidad CV", y = "Sensibilidad CV")
+  if (show_labels) p <- p + geom_text(nudge_y = .003, size = 2.8, check_overlap = TRUE)
+  p
+}
+
+scatter_global <- scatter_cv(c(0, 1), c(0, 1), "Contexto completo", "Escala 0%–100%")
+zoom_labels <- cv_summary |>
+  arrange(sensibilidad, especificidad) |>
+  mutate(etiqueta_y = seq(.878, .992, length.out = n()))
+scatter_zoom <- ggplot(cv_summary, aes(especificidad, sensibilidad)) +
+  geom_point(colour = "#6F4E9C", size = 3) +
+  geom_segment(data = zoom_labels,
+               aes(x = especificidad, y = sensibilidad, xend = 1.006, yend = etiqueta_y),
+               inherit.aes = FALSE, colour = "#8A8A8A", linewidth = .35) +
+  geom_text(data = zoom_labels, aes(x = 1.008, y = etiqueta_y, label = modelo),
+            inherit.aes = FALSE, hjust = 0, size = 3.4, colour = "#333333") +
+  coord_cartesian(xlim = c(.94, 1.03), ylim = c(.87, 1.005), clip = "off") +
+  scale_x_continuous(breaks = c(.94, .96, .98, 1), labels = percent) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Área ampliada", subtitle = "Especificidad 94%–100%; etiquetas conectadas a cada modelo", x = "Especificidad CV", y = "Sensibilidad CV") +
+  theme(plot.margin = margin(5.5, 78, 5.5, 5.5))
+scatter_global + plot_spacer() + scatter_zoom +
+  plot_layout(widths = c(1, .06, 1)) +
+  plot_annotation(title = "Sensibilidad frente a especificidad: contexto y zoom")
+```
+
+**Lectura del zoom.** Los paneles alineados separan contexto y detalle sin ocultar los límites de los ejes. La tabla CV conserva los valores exactos; el zoom sólo facilita comparar diferencias pequeñas entre modelos.
+
+**Lectura de comparación CV.** `r lider_cv$modelo` encabeza la sensibilidad media (`r percent(lider_cv$sensibilidad, accuracy = .1)`) y por eso entra primero al grupo de finalistas. El ranking muestra que sensibilidad y ROC-AUC no siempre ordenan igual los modelos; el diagrama sensibilidad-especificidad permite observar ese coste. Los puntos más cercanos a la esquina superior derecha equilibran mejor detección de malignos y control de falsos positivos, aunque la sensibilidad conserva prioridad en este análisis académico.
+
+```{r}
+#| label: curvas-roc-cv
+roc_by_fold <- cv_predictions |> group_by(modelo, id) |>
+  group_modify(~ roc_curve(.x, truth = diagnosis, .pred_M)) |> ungroup() |>
+  mutate(fpr = 1 - specificity)
+roc_grid <- seq(0, 1, length.out = 101)
+roc_average <- roc_by_fold |> group_by(modelo, id) |>
+  group_modify(~ {
+    curve <- .x |> arrange(fpr) |> group_by(fpr) |> summarise(sensitivity = max(sensitivity), .groups = "drop")
+    interpolated <- approx(curve$fpr, curve$sensitivity, xout = roc_grid, rule = 2)$y
+    # Toda ROC debe incluir explícitamente los extremos teóricos: evita que el
+    # promedio o el ajuste automático de ejes oculten el origen (0, 0).
+    interpolated[1] <- 0
+    interpolated[length(interpolated)] <- 1
+    tibble(fpr = roc_grid, sensibilidad = interpolated)
+  }) |> ungroup() |>
+  group_by(modelo, fpr) |>
+  summarise(sensibilidad = mean(sensibilidad), sd_sensibilidad = sd(sensibilidad), .groups = "drop") |>
+  mutate(inferior = pmax(0, sensibilidad - sd_sensibilidad), superior = pmin(1, sensibilidad + sd_sensibilidad))
+ggplot(roc_average, aes(fpr, sensibilidad, colour = modelo, fill = modelo)) +
+  geom_ribbon(aes(ymin = inferior, ymax = superior), alpha = .12, colour = NA, show.legend = FALSE) +
+  geom_line(linewidth = 1) + geom_abline(linetype = "dashed", inherit.aes = FALSE) + coord_equal() +
+  # Margen mínimo: evita que los tramos verticales en FPR = 0 queden ocultos
+  # detrás del eje y permite inspeccionar visualmente el origen.
+  scale_x_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = .025)) +
+  scale_y_continuous(labels = percent, limits = c(0, 1), expand = expansion(mult = .025)) +
+  labs(title = "ROC promedio out-of-fold: finalistas",
+       subtitle = "Línea: media de 5 folds; banda: ±1 desviación estándar", x = "Tasa de falsos positivos", y = "Sensibilidad", colour = "Modelo")
+```
+
+**Lectura ROC out-of-fold.** Las curvas se calculan con predicciones de folds no vistos por cada ajuste, por lo que no son una curva ajustada sobre los mismos casos usados para entrenar. Curvas más próximas a la esquina superior izquierda indican mejor discriminación; las bandas reflejan variación entre folds. El solapamiento parcial de bandas aconseja no declarar ganador clínico sólo por diferencias visuales pequeñas.
+
+## Ajuste y elección del campeón en entrenamiento
+
+Los tres finalistas se seleccionan por sensibilidad media CV; los empates se resuelven por ROC-AUC y balanced accuracy. El ajuste usa una validación cruzada estratificada de 3 folds y una grilla deliberadamente acotada, adecuada al tamaño del conjunto y a una comparación académica. Se optimizan parámetros propios de cada algoritmo cuando existen; la representación ya fue fijada en la etapa anterior. El campeón se elige aquí, antes de abrir la prueba.
+
+```{r}
+#| label: tuning-top3
+#| cache: false
+set.seed(20261022)
+repeated_folds <- vfold_cv(train_data, v = 3, strata = diagnosis)
+tune_one <- function(name) {
+  candidate <- switch(name,
+    "Elastic net" = list(spec = logistic_reg(penalty = tune(), mixture = tune()) |> set_engine("glmnet"), grid = grid_regular(penalty(range = c(-5, -1)), mixture(), levels = 2)),
+    "Árbol de decisión" = list(spec = decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart"), grid = grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 2)),
+    "SVM radial" = list(spec = svm_rbf(mode = "classification", cost = tune(), rbf_sigma = tune()) |> set_engine("kernlab"), grid = grid_regular(cost(), rbf_sigma(), levels = 2)),
+    NULL
+  )
+  if (is.null(candidate)) {
+    fitted <- fit_resamples(workflow() |> add_recipe(base_recipe) |> add_model(models[[name]]), resamples = repeated_folds, metrics = metrics_set)
+    return(list(name = name, best = NULL, workflow = workflow() |> add_recipe(base_recipe) |> add_model(models[[name]]), cv = collect_metrics(fitted)))
+  }
+  tuned <- tune_grid(workflow() |> add_recipe(base_recipe) |> add_model(candidate$spec), resamples = repeated_folds,
+                     grid = candidate$grid, metrics = metrics_set, control = control_grid(save_pred = TRUE))
+  best <- select_best(tuned, metric = "sens")
+  list(name = name, best = best, workflow = workflow() |> add_recipe(base_recipe) |> add_model(candidate$spec),
+       cv = collect_metrics(tuned) |> filter(.config == best$.config))
+}
+tuned_runs <- purrr::map(top_three, tune_one)
+
+tuned_summary <- purrr::map_dfr(tuned_runs, function(x) {
+  x$cv |> select(.metric, mean) |>
+    pivot_wider(names_from = .metric, values_from = mean) |> mutate(modelo = x$name)
+}) |>
+  rename(sensibilidad = sens, especificidad = spec, precision = ppv,
+         balanced_accuracy = bal_accuracy, accuracy = accuracy, roc_auc = roc_auc)
+
+champion_cv <- tuned_summary |> arrange(desc(sensibilidad), desc(roc_auc), desc(balanced_accuracy)) |> slice_head(n = 1)
+champion_run <- tuned_runs[[match(champion_cv$modelo, purrr::map_chr(tuned_runs, "name"))]]
+champion_workflow <- if (is.null(champion_run$best)) champion_run$workflow else finalize_workflow(champion_run$workflow, champion_run$best)
+champion_last_fit <- last_fit(champion_workflow, split = split_data, metrics = metrics_set)
+champion_test <- collect_metrics(champion_last_fit) |> select(.metric, .estimate) |> pivot_wider(names_from = .metric, values_from = .estimate) |>
+  rename(sensibilidad = sens, especificidad = spec, precision = ppv, balanced_accuracy = bal_accuracy, accuracy = accuracy, roc_auc = roc_auc) |>
+  mutate(modelo = champion_cv$modelo)
+champion_predictions <- collect_predictions(champion_last_fit)
+champion_cm <- conf_mat(champion_predictions, truth = diagnosis, estimate = .pred_class)
+```
+
+```{r}
+#| label: resultados-tuning
+kable(tuned_summary |> select(modelo, sensibilidad, especificidad, balanced_accuracy, roc_auc), digits = 3,
+      col.names = c("Finalista", "Sens.", "Espec.", "Bal. acc.", "AUROC"), caption = "Finalistas tras ajuste: validación cruzada estratificada de 3 folds")
+kable(champion_test |> select(modelo, sensibilidad, especificidad, precision, balanced_accuracy, accuracy, roc_auc), digits = 3,
+      col.names = c("Campeón", "Sens.", "Espec.", "Prec.", "Bal. acc.", "Accuracy", "AUROC"), caption = "Evaluación única de la prueba reservada: campeón elegido exclusivamente por CV")
+champion_cm
+```
+
+**Lectura del ajuste.** El campeón es **`r champion_cv$modelo`**, elegido por sensibilidad repetida CV (`r percent(champion_cv$sensibilidad, accuracy = .1)`), con AUROC y balanced accuracy como controles. Sólo después se abre la prueba: alcanza sensibilidad de `r percent(champion_test$sensibilidad, accuracy = .1)`. No se busca un ganador nuevo en prueba; hacerlo convertiría la prueba en otra etapa de selección y sobreestimaría el resultado.
+
+**Resultado predictivo.** Los finalistas se eligieron sin consultar la prueba reservada. La sensibilidad es el criterio principal, pero la tabla final mantiene especificidad, balanced accuracy y ROC-AUC para mostrar el coste de cualquier mejora. Estos resultados son académicos y no validan uso clínico, generalización externa ni umbrales de decisión reales.
+
+# 9. Hallazgos y conclusiones
+
+## Hallazgos sobre los datos
+
+1. **Calidad y cobertura.** La fuente aporta `r nrow(analysis_data)` masas mamarias, `r ncol(full_numeric_features)` mediciones nucleares y un diagnóstico observado para cada caso. La única columna descartada de la vista analítica estaba completamente vacía por el delimitador final. No se encontraron faltantes, registros idénticos ni IDs duplicados; por tanto, el análisis no requirió imputación, deduplicación ni eliminación de observaciones.
+
+2. **Distribución del diagnóstico.** Se observan `r class_counts$n[class_counts$diagnosis == "B"]` casos benignos y `r class_counts$n[class_counts$diagnosis == "M"]` malignos. El predominio benigno es moderado, de modo que accuracy no basta para evaluar el desempeño: detectar malignos requiere revisar sensibilidad junto con especificidad y balanced accuracy.
+
+3. **Señal descriptiva por características.** Los boxplots, el forest plot y el AUROC univariado convergen en un patrón: las mediciones de tamaño, perímetro, área y concavidad tienden a ser mayores en el grupo maligno. Entre las medidas promedio, `r as.character(mean_effects$etiqueta[nrow(mean_effects)])` presenta la mayor separación estandarizada; de forma aislada, `r auroc_univariado$variable[1]` obtiene el AUROC más alto (`r round(auroc_univariado$auroc[1], 3)`) en entrenamiento. Existe, sin embargo, solapamiento entre diagnósticos, por lo que ninguna medición aislada constituye una regla suficiente.
+
+## Hallazgos sobre estructura y representación
+
+4. **Redundancia informativa.** Las mediciones no aportan información completamente independiente: `r nrow(high_corr_pairs)` de `r nrow(correlation_pairs)` pares presentan correlación absoluta igual o superior a 0.85. La relación más intensa se observa entre `r strongest_pair$variable_1` y `r strongest_pair$variable_2` (`r round(strongest_pair$correlacion, 3)`). Esto explica por qué los coeficientes lineales y las importancias de un bosque pueden repartirse entre variables similares.
+
+5. **PCA como síntesis, no como decisión automática.** Los primeros dos componentes resumen `r percent(sum(explained_variance), accuracy = .1)` de la variabilidad total; se requieren `r pca_thresholds$componente[pca_thresholds$umbral == .80]` componentes para alcanzar 80% y `r pca_thresholds$componente[pca_thresholds$umbral == .90]` para 90%. PCA hace visible una estructura compartida y una separación parcial de diagnósticos, pero la proyección no muestra grupos clínicos puros. Por ello, PCA se trató como una hipótesis que debía ser contrastada, no como una simplificación impuesta.
+
+6. **Representación elegida por evidencia validada.** La ablación comparó `mean`, `mean + worst`, las 30 variables y una versión PCA bajo las mismas particiones. La representación seleccionada fue **`r selected_representation_name`** por su sensibilidad media CV, usando AUROC y balanced accuracy para desempatar. En consecuencia, la presencia de correlación no llevó a eliminar variables arbitrariamente: la decisión se basó en desempeño fuera de cada fold.
+
+## Conclusión predictiva
+
+7. **Comparación de algoritmos.** Diez clasificadores se compararon con validación cruzada estratificada. La regla de clase mayoritaria se mantuvo como referencia y evidencia que una accuracy razonable puede coexistir con sensibilidad nula para malignos. El ranking mostró que sensibilidad, especificidad y AUROC no siempre favorecen al mismo modelo; por eso la selección no se redujo a una única métrica.
+
+8. **Modelo final del estudio.** Tras el ajuste de los tres finalistas, **`r champion_cv$modelo`** fue elegido exclusivamente con datos de entrenamiento por sensibilidad CV de `r percent(champion_cv$sensibilidad, accuracy = .1)`, con AUROC de `r round(champion_cv$roc_auc, 3)` y balanced accuracy de `r round(champion_cv$balanced_accuracy, 3)`. En la única evaluación sobre la prueba reservada, obtuvo sensibilidad de `r percent(champion_test$sensibilidad, accuracy = .1)`, especificidad de `r percent(champion_test$especificidad, accuracy = .1)`, balanced accuracy de `r percent(champion_test$balanced_accuracy, accuracy = .1)` y AUROC de `r round(champion_test$roc_auc, 3)`.
+
+En conjunto, el proyecto demuestra que las características nucleares contienen una señal predictiva fuerte y estructurada para distinguir los diagnósticos de este conjunto. La contribución principal no es sólo el desempeño final: es haber convertido una exploración de diferencias, redundancia y reducción de dimensión en una decisión reproducible sobre representación y modelo, manteniendo la prueba final fuera de todas las decisiones previas.
+
+## Renderizado
+
+Desde la raíz del proyecto:
+
+```bash
+quarto render notebook/analisis_integral.qmd --to html
+quarto render notebook/analisis_integral.qmd --to pdf
+mv notebook/analisis_integral.pdf report/analisis_integral.pdf
+```
+
+El primer comando deja `analisis_integral.html` junto al notebook. Los dos últimos generan y ubican el PDF final en `report/`.

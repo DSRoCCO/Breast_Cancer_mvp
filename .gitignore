@@ -1,0 +1,54 @@
+# R: sesiones y archivos temporales locales
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+*.RDataTmp
+
+# Bibliotecas instaladas localmente (renv.lock sí se versiona)
+.Rlib/
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+notebook/renv/
+
+# Quarto / knitr: cachés, archivos intermedios y recursos de renderizado
+.quarto/
+_freeze/
+*_cache/
+*_files/
+*.knit.md
+*.tex
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Configuración local, credenciales y despliegues
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
+.bootstrap/
+skills/
+rsconnect/
+
+# Futuros artefactos binarios generados por el MVP
+artifacts/*.rds
+artifacts/*.RDS
+artifacts/*.pkl
+artifacts/*.joblib
+
+# Archivos del sistema y del editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
