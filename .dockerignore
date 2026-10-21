@@ -1,0 +1,21 @@
+# Contexto de Docker futuro: conservar app/, R/, artifacts/, renv/ y lockfile.
+.git/
+.Rlib/
+.quarto/
+_freeze/
+*_cache/
+*_files/
+notebook/
+report/
+data/
+tests/
+skills/
+.aws/
+.codex/
+.agents/
+.bootstrap/
+.env
+.env.*
+*.Rhistory
+*.RData
+*.log

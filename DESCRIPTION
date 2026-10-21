@@ -1,0 +1,21 @@
+Package: breastcancermvp
+Type: Project
+Title: Breast Cancer Classification MVP
+Version: 0.1.0
+Description: Reproducible Shiny demonstrator backed by a validated Elastic Net workflow.
+License: MIT
+Encoding: UTF-8
+Imports:
+    dials,
+    dplyr,
+    ggplot2,
+    glmnet,
+    parsnip,
+    recipes,
+    rsample,
+    scales,
+    shiny,
+    tidyr,
+    tune,
+    workflows,
+    yardstick
