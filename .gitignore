@@ -35,11 +35,17 @@ _freeze/
 .env.*
 !.env.example
 .aws/
+.agent
 .codex/
 .agents/
 .bootstrap/
 skills/
 rsconnect/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Futuros artefactos binarios generados por el MVP
 artifacts/*.rds
@@ -52,3 +58,5 @@ artifacts/*.joblib
 Thumbs.db
 .vscode/
 .idea/
+.cursor/
+.zed/

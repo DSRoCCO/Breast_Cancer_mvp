@@ -1,5 +1,7 @@
-# Contexto de Docker futuro: conservar app/, R/, artifacts/, renv/ y lockfile.
+# El builder necesita data/ y tests/ para generar y validar los artefactos.
+# La etapa final no copia datos crudos ni pruebas.
 .git/
+.github/
 .Rlib/
 .quarto/
 _freeze/
@@ -7,15 +9,24 @@ _freeze/
 *_files/
 notebook/
 report/
-data/
-tests/
+artifacts/
 skills/
 .aws/
+.agent
 .codex/
 .agents/
 .bootstrap/
+.cursor/
+.idea/
+.vscode/
+.zed/
 .env
 .env.*
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
 *.Rhistory
 *.RData
 *.log

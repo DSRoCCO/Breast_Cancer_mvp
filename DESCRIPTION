@@ -6,11 +6,20 @@ Description: Reproducible Shiny demonstrator backed by a validated Elastic Net w
 License: MIT
 Encoding: UTF-8
 Imports:
+    bonsai,
     dials,
+    discrim,
     dplyr,
     ggplot2,
     glmnet,
+    kernlab,
+    kknn,
+    knitr,
+    naivebayes,
+    nnet,
     parsnip,
+    patchwork,
+    purrr,
     recipes,
     rsample,
     scales,

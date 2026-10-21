@@ -53,4 +53,4 @@ El esquema de los agregados descriptivos se versiona mediante `mvp_schema_versio
 
 ## Exclusiones conocidas
 
-No hay inferencia causal, clusters clínicos, evaluación de equidad, estabilidad temporal, validación externa, autenticación, persistencia de consultas, API ni despliegue. Docker y CI se incorporarán como etapa posterior y no deben interpretarse como ya validados.
+No hay inferencia causal, clusters clínicos, evaluación de equidad, estabilidad temporal, validación externa, autenticación, persistencia de consultas, API ni despliegue. El proyecto incluye Docker y una validación CI del contenedor; eso no equivale a aprobación clínica ni despliegue externo.
