@@ -6,7 +6,7 @@ El contenedor es la forma recomendada de ejecutar el MVP: fija R 4.3.3, restaura
 
 ## Resultados del análisis
 
-- [Ver el análisis exportado en HTML](notebook/analisis_integral.html)
+- [Ver el análisis exportado en HTML](https://dsrocco.github.io/Breast_Cancer_mvp/analisis_integral.html)
 - [Descargar el informe exportado en PDF](report/analisis_integral.pdf)
 
 ## Estructura
