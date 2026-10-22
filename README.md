@@ -4,10 +4,16 @@ Proyecto de portafolio que estudia características nucleares de masas mamarias 
 
 El contenedor es la forma recomendada de ejecutar el MVP: fija R 4.3.3, restaura las dependencias bloqueadas y genera los artefactos del modelo desde los datos incluidos durante su construcción.
 
+## Resultados del análisis
+
+- [Ver el análisis exportado en HTML](notebook/analisis_integral.html)
+- [Descargar el informe exportado en PDF](report/analisis_integral.pdf)
+
 ## Estructura
 
 - `notebook/analisis_integral.qmd`: análisis reproducible y documentación metodológica.
-- `report/analisis_integral.pdf`: informe exportado.
+- `notebook/analisis_integral.html`: análisis exportado en HTML.
+- `report/analisis_integral.pdf`: informe exportado en PDF.
 - `R/`: configuración, contrato de datos, artefactos descriptivos, entrenamiento y predicción.
 - `app/`: interfaz Shiny y módulos de presentación.
 - `artifacts/`: workflow, metadatos y resumen descriptivo generados localmente; no se versionan.
