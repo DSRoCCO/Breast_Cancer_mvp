@@ -6,7 +6,7 @@ El contenedor es la forma recomendada de ejecutar el MVP: fija R 4.3.3, restaura
 
 ## Resultados del análisis
 
-- [Ver el análisis exportado en HTML](https://dsrocco.github.io/Breast_Cancer_mvp/analisis_integral.html)
+- [Ver el análisis publicado en GitHub Pages](https://dsrocco.github.io/Breast_Cancer_mvp/)
 - [Descargar el informe exportado en PDF](report/analisis_integral.pdf)
 
 ## Estructura
@@ -21,6 +21,7 @@ El contenedor es la forma recomendada de ejecutar el MVP: fija R 4.3.3, restaura
 - `tests/`: pruebas de humo de los dos módulos.
 - `Dockerfile`: construcción multi-etapa, prueba y ejecución de la aplicación.
 - `.github/workflows/container.yml`: validación automática del contenedor en cada push y pull request.
+- `.github/workflows/pages.yml`: restaura el entorno R bloqueado, renderiza el análisis Quarto y publica el HTML en GitHub Pages al actualizar `main`.
 
 ## Ejecutar con Docker (recomendado)
 
@@ -132,6 +133,7 @@ mv notebook/analisis_integral.pdf report/analisis_integral.pdf
 - `renv.lock` fija las versiones de los paquetes de R. No se instalan dependencias automáticamente desde el código de la aplicación.
 - El `Dockerfile` usa R 4.3.3, entrena y prueba antes de publicar la imagen de ejecución.
 - `.github/workflows/container.yml` reconstruye la imagen e inicia Shiny en cada push y pull request. Se conserva en Git precisamente para que GitHub pueda ejecutar esa validación, pero se excluye del contexto Docker porque no se necesita dentro de la imagen.
+- `.github/workflows/pages.yml` usa R 4.3.3, restaura `renv.lock`, renderiza `notebook/analisis_integral.qmd` y despliega el resultado como la página raíz. En GitHub, habilite **Settings → Pages → Source: GitHub Actions** una sola vez si el repositorio aún no tiene Pages configurado.
 - `.gitignore` y `.dockerignore` excluyen secretos, configuración local de agentes/editores, cachés, artefactos locales, informes y datos innecesarios en tiempo de ejecución.
 
 Para actualizar las dependencias de manera deliberada, ejecute el entrenamiento y las pruebas, después revise el cambio de `renv.lock` antes de versionarlo:
